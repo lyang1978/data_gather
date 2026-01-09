@@ -15,8 +15,8 @@ REM ============================================================
 
 cd /d D:\OneDrive\Projects\data_gather
 
-REM Activate virtual environment and run the scheduled script
-.venv\Scripts\python.exe src\scheduled_run.py
+REM Run the CLI with HTML report export (which also emails the report)
+.venv\Scripts\python.exe src\cli.py --export-html
 
 REM Capture exit code
 set EXIT_CODE=%ERRORLEVEL%

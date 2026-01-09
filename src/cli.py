@@ -334,7 +334,7 @@ _setup_path()
 
 from datagather.datagather import datagather
 from analyzer.analyzer import analyze
-from emailer.netsuite_sender import send_email_netsuite
+from emailer.msgraph_sender import create_draft_msgraph, send_report_email
 from emailer.netsuite_stamper import stamp_last_inq_sent_date_netsuite
 
 
@@ -422,43 +422,48 @@ def build_vendor_briefs(
 
 
 # -----------------------------------------------------------------------------
-# SEND + STAMP (deterministic)
+# DRAFT CREATION + OPTIONAL STAMPING (deterministic)
 # -----------------------------------------------------------------------------
 
-def send_and_stamp(
+def create_draft_and_record(
     *,
     to: str,
     subject: str,
     body: str,
     po_ids: list[int | str],
-    send_enabled: bool = True,
+    draft_enabled: bool = True,
+    stamp_enabled: bool = False,
 ) -> dict[str, Any]:
     """
-    Deterministic send + stamp operation.
+    Create email draft in Outlook Drafts folder, optionally stamp POs.
 
-    - If send_enabled=False: returns skipped result, no send, no stamp.
-    - If DRY_RUN=true (env): sends in dry-run mode (logged but not delivered), no stamp.
-    - Otherwise: sends email, stamps PO headers with today's date.
+    - If draft_enabled=False: returns skipped result, no draft created.
+    - If DRY_RUN=true (env): logs draft but doesn't create in Outlook.
+    - Otherwise: creates draft in Outlook Drafts folder.
+    - If stamp_enabled=True and draft succeeds: stamps PO headers with today's date.
 
-    Returns: {"send": {...}, "stamp": {...} or None, "skipped": bool}
+    Returns: {"draft": {...}, "stamp": {...} or None, "skipped": bool, "po_ids": [...]}
     """
-    if not send_enabled:
+    if not draft_enabled:
         return {
-            "send": {"ok": False, "skipped": True, "reason": "SEND_EMAILS=false"},
+            "draft": {"ok": False, "skipped": True, "reason": "SEND_EMAILS=false"},
             "stamp": None,
             "skipped": True,
+            "po_ids": po_ids,
         }
 
-    send_result = send_email_netsuite(to=to, subject=subject, body=body)
+    draft_result = create_draft_msgraph(to=to, subject=subject, body=body)
 
+    # Stamp POs if draft succeeded and stamping is enabled
     stamp_result = None
-    if send_result.get("ok") and not send_result.get("dry_run", False):
+    if stamp_enabled and draft_result.get("ok") and not draft_result.get("dry_run"):
         stamp_result = stamp_last_inq_sent_date_netsuite(po_ids=po_ids)
 
     return {
-        "send": send_result,
+        "draft": draft_result,
         "stamp": stamp_result,
         "skipped": False,
+        "po_ids": po_ids,
     }
 
 
@@ -470,12 +475,15 @@ async def run_agent_mode(
     briefs: list[dict[str, Any]],
     *,
     sleep_sec: float = 1.0,
-    send_enabled: bool = True,
+    draft_enabled: bool = True,
+    stamp_enabled: bool = False,
     verbose: bool = False,
 ) -> dict[str, Any]:
     """
-    Run LLM agent per vendor to draft and send emails.
+    Run LLM agent per vendor to draft emails.
 
+    Creates drafts in Outlook Drafts folder for manual review before sending.
+    Optionally stamps POs after successful draft creation.
     Uses the agents library with Gemini/OpenAI for natural language email drafting.
     """
     # Late imports to avoid loading agent deps if not needed
@@ -501,28 +509,30 @@ async def run_agent_mode(
     captured_emails: list[dict[str, Any]] = []
 
     @function_tool
-    def send_and_stamp_tool(to: str, subject: str, body: str, po_ids_json: str) -> str:
+    def create_draft_tool(to: str, subject: str, body: str, po_ids_json: str) -> str:
         """
-        Deterministic: sends email, then stamps last inquiry sent date for provided PO internal IDs.
+        Create email draft in Outlook Drafts folder for manual review.
         po_ids_json must be a JSON array string like: "[626905, 620477]"
         """
         po_ids = json.loads(po_ids_json)
-        result = send_and_stamp(
+        result = create_draft_and_record(
             to=to,
             subject=subject,
             body=body,
             po_ids=po_ids,
-            send_enabled=send_enabled,
+            draft_enabled=draft_enabled,
+            stamp_enabled=stamp_enabled,
         )
 
         # Capture for HTML export
-        send_result = result.get("send", {})
+        draft_result = result.get("draft", {})
+        stamp_result = result.get("stamp")
         if result.get("skipped"):
             status = "skipped"
-        elif send_result.get("dry_run"):
+        elif draft_result.get("dry_run"):
             status = "dry_run"
-        elif send_result.get("ok"):
-            status = "sent"
+        elif draft_result.get("ok"):
+            status = "drafted"
         else:
             status = "failed"
 
@@ -532,6 +542,10 @@ async def run_agent_mode(
             "body": body,
             "status": status,
             "po_ids": po_ids,
+            "draft_id": draft_result.get("draft_id"),
+            "web_link": draft_result.get("web_link"),
+            "stamped": stamp_result.get("ok") if stamp_result else False,
+            "stamp_count": len(stamp_result.get("updated", [])) if stamp_result else 0,
         })
 
         return json.dumps(result)
@@ -539,33 +553,44 @@ async def run_agent_mode(
     instructions = (
         f"You are an email writer for vendor PO status inquiries.\n\n"
         f"YOUR ROLE:\n"
-        f"- You will receive a vendor brief containing PO data that has already been analyzed.\n"
-        f"- Your job is to write a professional, natural-sounding email and send it.\n"
-        f"- You have ONE tool: send_and_stamp_tool. Use it to send the email.\n\n"
+        f"- You receive a vendor brief with PO data that has already been analyzed.\n"
+        f"- Write a professional HTML email and create a draft using create_draft_tool.\n"
+        f"- The draft will be saved to Outlook Drafts for manual review before sending.\n\n"
         f"RULES:\n"
-        f"1) Do NOT invent facts. Only use the PO/line data provided in the brief.\n"
-        f"2) Write natural, varied emails. Avoid templated/robotic language.\n"
-        f"3) Choose tone based on PO state:\n"
-        f"   - Due: polite, confirm readiness for upcoming shipment.\n"
-        f"   - Past Due: more direct/firm, express urgency.\n"
-        f"   - Severity increases with days past due. Orders 30+ days past due risk stockouts.\n"
-        f"   - Mixed (some Due, some Past Due): acknowledge both situations.\n"
-        f"4) Consolidate all POs for the vendor into ONE email.\n"
-        f"5) Always end the email with:\n"
-        f"   Best regards,\n"
-        f"   {name}\n"
-        f"   {company}\n\n"
-        f"6) After calling send_and_stamp_tool, do NOT repeat the email content.\n"
-        f"   Just confirm the action was taken.\n\n"
-        f"TOOL USAGE:\n"
-        f"- Call send_and_stamp_tool with: to, subject, body, po_ids_json\n"
-        f"- po_ids_json must be a JSON array string, e.g., '[\"628955\", \"628957\"]'\n"
+        f"1) Only use facts from the brief. Do NOT invent data.\n"
+        f"2) Write natural, varied emails. Avoid robotic/templated language.\n"
+        f"3) Tone based on PO state:\n"
+        f"   - Due: polite, confirm shipment readiness.\n"
+        f"   - Past Due: direct/firm, express urgency.\n"
+        f"   - 30+ days past due: risk of stockouts, higher urgency.\n"
+        f"   - Mixed: acknowledge both situations.\n"
+        f"4) ONE email per vendor, consolidating all their POs.\n"
+        f"5) REQUIRED: Write the body as HTML. Use <p> for paragraphs, <br> for line breaks.\n"
+        f"6) REQUIRED HTML TABLE - Include a styled table with ALL open lines:\n"
+        f"   <table border='1' cellpadding='5' cellspacing='0' style='border-collapse: collapse;'>\n"
+        f"   <tr style='background-color: #f2f2f2;'>\n"
+        f"     <th>Date Ordered</th><th>PO#</th><th>SKU</th><th>Qty Ordered</th><th>Shipped</th><th>Open</th>\n"
+        f"   </tr>\n"
+        f"   <tr><td>7/24/2025</td><td>PO7574</td><td>F1SF314FL-2R</td><td>120</td><td></td><td>120</td></tr>\n"
+        f"   </table>\n"
+        f"   (populate from brief: po_date, po_number, item, quantity, leave Shipped blank, qty_open)\n\n"
+        f"7) After the table, include clear instructions asking the vendor to:\n"
+        f"   - Complete the 'Shipped' column with quantities already shipped\n"
+        f"   - Provide tracking/shipment references for shipped items\n"
+        f"   - Provide expected ship dates for items not yet shipped\n"
+        f"   - State this is required so we can update our system\n\n"
+        f"8) End with:\n"
+        f"   <p>Best regards,<br>{name}<br>{company}</p>\n\n"
+        f"9) After calling create_draft_tool, just confirm - don't repeat email content.\n\n"
+        f"TOOL: create_draft_tool(to, subject, body, po_ids_json)\n"
+        f"  - body must be HTML formatted\n"
+        f"  - po_ids_json is a JSON array string: '[\"628955\", \"628957\"]'\n"
     )
 
     email_manager = Agent(
-        name="PO Email Writer",
+        name="PO Email Drafter",
         instructions=instructions,
-        tools=[send_and_stamp_tool],
+        tools=[create_draft_tool],
     )
 
     async def run_one_vendor(brief: dict[str, Any], *, max_retries: int = 5) -> dict[str, Any]:
@@ -576,7 +601,7 @@ async def run_agent_mode(
 
         prompt = (
             "Process exactly ONE vendor brief below.\n"
-            "Draft a subject and body, then call send_and_stamp_tool.\n"
+            "Draft a subject and body, then call create_draft_tool.\n"
             "Do not process any other vendors.\n\n"
             f"vendor_email: {vendor_email}\n"
             f"po_ids_json: {po_ids_json}\n\n"
@@ -641,14 +666,17 @@ async def run_agent_mode(
 def run_deterministic_mode(
     briefs: list[dict[str, Any]],
     *,
-    send_enabled: bool = True,
+    draft_enabled: bool = True,
+    stamp_enabled: bool = False,
     sleep_sec: float = 0.5,
     verbose: bool = False,
 ) -> dict[str, Any]:
     """
-    Run deterministic email sending without LLM.
+    Run deterministic email drafting without LLM.
 
-    Uses the pre-built email content from analyzer.build_vendor_inquiries_by_vendor().
+    Creates drafts in Outlook Drafts folder for manual review.
+    Optionally stamps POs after successful draft creation.
+    Uses template-based email content.
     """
     import time
 
@@ -668,12 +696,13 @@ def run_deterministic_mode(
         subject = _build_deterministic_subject(brief)
         body = _build_deterministic_body(brief)
 
-        result = send_and_stamp(
+        result = create_draft_and_record(
             to=vendor_email,
             subject=subject,
             body=body,
             po_ids=po_ids,
-            send_enabled=send_enabled,
+            draft_enabled=draft_enabled,
+            stamp_enabled=stamp_enabled,
         )
         results.append({
             "vendor_email": vendor_email,
@@ -681,23 +710,23 @@ def run_deterministic_mode(
             **result,
         })
 
-        send_result = result.get("send", {})
+        draft_result = result.get("draft", {})
         stamp_result = result.get("stamp")
 
         # Determine status for HTML report
         if result.get("skipped"):
             status = "skipped"
-            print("SKIPPED (send disabled)")
-        elif send_result.get("dry_run"):
+            print("SKIPPED (drafts disabled)")
+        elif draft_result.get("dry_run"):
             status = "dry_run"
             print("DRY-RUN")
-        elif send_result.get("ok"):
-            status = "sent"
-            stamp_count = len(stamp_result.get("updated", [])) if stamp_result else 0
-            print(f"SENT | stamped {stamp_count} POs")
+        elif draft_result.get("ok"):
+            status = "drafted"
+            stamp_info = f" | Stamped {len(stamp_result.get('updated', []))} POs" if stamp_result and stamp_result.get("ok") else ""
+            print(f"DRAFTED{stamp_info}")
         else:
             status = "failed"
-            print(f"FAILED: {send_result}")
+            print(f"FAILED: {draft_result}")
 
         # Capture email for HTML export
         emails.append({
@@ -708,6 +737,10 @@ def run_deterministic_mode(
             "status": status,
             "po_count": po_count,
             "pos": brief.get("pos", []),
+            "draft_id": draft_result.get("draft_id"),
+            "web_link": draft_result.get("web_link"),
+            "stamped": stamp_result.get("ok") if stamp_result else False,
+            "stamp_count": len(stamp_result.get("updated", [])) if stamp_result else 0,
         })
 
         if i < len(briefs):
@@ -716,8 +749,8 @@ def run_deterministic_mode(
     return {
         "mode": "deterministic",
         "processed": len(results),
-        "succeeded": sum(1 for r in results if r.get("send", {}).get("ok")),
-        "failed": sum(1 for r in results if not r.get("send", {}).get("ok") and not r.get("skipped")),
+        "succeeded": sum(1 for r in results if r.get("draft", {}).get("ok")),
+        "failed": sum(1 for r in results if not r.get("draft", {}).get("ok") and not r.get("skipped")),
         "skipped": sum(1 for r in results if r.get("skipped")),
         "results": results,
         "emails": emails,  # For HTML export
@@ -885,10 +918,13 @@ def main() -> int:
     else:
         dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
 
-    # Determine send_enabled (SEND_EMAILS gate)
-    send_enabled = os.getenv("SEND_EMAILS", "true").lower() == "true"
+    # Determine draft_enabled (SEND_EMAILS gate - reused as draft gate)
+    draft_enabled = os.getenv("SEND_EMAILS", "true").lower() == "true"
     if args.live:
-        send_enabled = True
+        draft_enabled = True
+
+    # Determine stamp_enabled (STAMP_POS gate - stamps POs after successful draft)
+    stamp_enabled = os.getenv("STAMP_POS", "false").lower() == "true"
 
     # Get other settings
     max_emails = args.max_emails or int(os.getenv("MAX_EMAILS", "9999"))
@@ -908,7 +944,7 @@ def main() -> int:
     print(f"Max emails: {max_emails} | Sleep: {sleep_sec}s")
     if test_vendor:
         print(f"Test vendor filter: {test_vendor}")
-    print(f"Send enabled: {send_enabled}")
+    print(f"Draft enabled: {draft_enabled} | Stamp POs: {stamp_enabled}")
     print("=" * 60)
 
     # Phase 1: Data gathering (deterministic)
@@ -955,7 +991,8 @@ def main() -> int:
     if args.no_agent:
         result = run_deterministic_mode(
             briefs,
-            send_enabled=send_enabled,
+            draft_enabled=draft_enabled,
+            stamp_enabled=stamp_enabled,
             sleep_sec=sleep_sec,
             verbose=args.verbose,
         )
@@ -963,7 +1000,8 @@ def main() -> int:
         result = asyncio.run(run_agent_mode(
             briefs,
             sleep_sec=sleep_sec,
-            send_enabled=send_enabled,
+            draft_enabled=draft_enabled,
+            stamp_enabled=stamp_enabled,
             verbose=args.verbose,
         ))
 
@@ -987,7 +1025,7 @@ def main() -> int:
             "dry_run": dry_run,
             "max_emails": max_emails,
             "sleep_sec": sleep_sec,
-            "send_enabled": send_enabled,
+            "draft_enabled": draft_enabled,
             "test_vendor": test_vendor or "(none)",
             "days_old": args.days_old,
             "no_agent": args.no_agent,
@@ -1004,6 +1042,31 @@ def main() -> int:
         output_path = None if args.export_html == "auto" else args.export_html
         saved_path = save_html_report(html, output_path)
         print(f"\nHTML report saved to: {saved_path}")
+
+        # Email the report to user
+        report_recipient = os.getenv("MICROSOFT_USER_EMAIL", "leon.yang@apachemfg.com")
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        draft_count = result.get("succeeded", 0)
+
+        report_result = send_report_email(
+            to=report_recipient,
+            subject=f"PO Inquiry Report - {timestamp} ({draft_count} drafts created)",
+            body=(
+                f"PO Vendor Inquiry Report\n\n"
+                f"Run completed at: {timestamp}\n"
+                f"Mode: {'DRY-RUN' if dry_run else 'LIVE'}\n"
+                f"Drafts created: {draft_count}\n"
+                f"Failed: {result.get('failed', 0)}\n\n"
+                f"Please review the attached HTML report and the drafts in your Outlook Drafts folder.\n"
+                f"After reviewing, send the emails manually and run the PO stamping process.\n"
+            ),
+            attachment_path=saved_path,
+        )
+
+        if report_result.get("ok"):
+            print(f"Report emailed to: {report_recipient}")
+        else:
+            print(f"Failed to email report: {report_result.get('error')}")
 
     return 0 if result.get("failed", 0) == 0 else 1
 

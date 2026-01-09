@@ -3,11 +3,14 @@ PO Email Agent Runner
 
 Workflow:
 1. DETERMINISTIC: Pull data from NetSuite, analyze POs, build vendor briefs
-2. LLM: Write emails with natural tone (one per vendor)
-3. DETERMINISTIC: Send email via NetSuite RESTlet, stamp PO headers
+2. LLM: Draft emails with natural tone (one per vendor)
+3. DETERMINISTIC: Create draft in Outlook Drafts folder for manual review
 
 The LLM agent ONLY writes the email - it does not have access to data-gathering tools.
 All data is provided to the agent via the vendor brief in the prompt.
+
+NOTE: PO stamping is NOT done automatically. After manually reviewing and sending
+emails from your Drafts folder, run the stamping process separately.
 """
 
 import asyncio
@@ -22,7 +25,7 @@ from openai import RateLimitError
 
 from datagather.datagather import datagather
 from analyzer.analyzer import analyze
-from emailer.netsuite_sender import send_email_netsuite
+from emailer.msgraph_sender import create_draft_msgraph
 from emailer.netsuite_stamper import stamp_last_inq_sent_date_netsuite
 
 
@@ -30,38 +33,51 @@ load_dotenv()
 
 
 # -----------------------------------------------------------------------------
-# DETERMINISTIC SEND + STAMP
+# DETERMINISTIC DRAFT CREATION + OPTIONAL STAMPING
 # -----------------------------------------------------------------------------
 
-def send_and_stamp(
+def create_draft_and_record(
     *,
     to: str,
     subject: str,
     body: str,
     po_ids: list[int | str],
-    send_enabled: bool = True,
+    draft_enabled: bool = True,
+    stamp_enabled: bool = False,
 ) -> dict[str, Any]:
     """
-    Deterministic send + stamp operation.
+    Create email draft in Outlook Drafts folder, optionally stamp POs.
 
-    - If send_enabled=False: returns skipped result, no send, no stamp.
-    - If DRY_RUN=true (env): sends in dry-run mode (logged but not delivered), no stamp.
-    - Otherwise: sends email, stamps PO headers with today's date.
+    - If draft_enabled=False: returns skipped result, no draft created.
+    - If DRY_RUN=true (env): logs draft but doesn't create in Outlook.
+    - Otherwise: creates draft in Outlook Drafts folder.
+    - If stamp_enabled=True and draft succeeds: stamps PO headers with today's date.
+
+    Environment variables:
+        DRY_RUN=true      - Log drafts but don't create in Outlook
+        STAMP_POS=true    - Stamp POs after successful draft creation
     """
-    if not send_enabled:
+    if not draft_enabled:
         return {
-            "send": {"ok": False, "skipped": True, "reason": "SEND_EMAILS=false"},
+            "draft": {"ok": False, "skipped": True, "reason": "SEND_EMAILS=false"},
             "stamp": None,
             "skipped": True,
+            "po_ids": po_ids,
         }
 
-    send_result = send_email_netsuite(to=to, subject=subject, body=body)
+    draft_result = create_draft_msgraph(to=to, subject=subject, body=body)
 
+    # Stamp POs if draft succeeded and stamping is enabled
     stamp_result = None
-    if send_result.get("ok") and not send_result.get("dry_run", False):
+    if stamp_enabled and draft_result.get("ok") and not draft_result.get("dry_run"):
         stamp_result = stamp_last_inq_sent_date_netsuite(po_ids=po_ids)
 
-    return {"send": send_result, "stamp": stamp_result, "skipped": False}
+    return {
+        "draft": draft_result,
+        "stamp": stamp_result,
+        "skipped": False,
+        "po_ids": po_ids,
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -71,27 +87,29 @@ def send_and_stamp(
 def create_email_agent(
     *,
     send_enabled: bool = True,
+    stamp_enabled: bool = False,
     captured_emails: list[dict[str, Any]] | None = None,
 ) -> Agent:
     """
-    Create an email-writing agent with send_and_stamp_tool.
+    Create an email-drafting agent with create_draft_tool.
 
     Args:
-        send_enabled: Whether to actually send emails (respects SEND_EMAILS gate)
-        captured_emails: Optional list to capture sent emails for reporting
+        send_enabled: Whether to create drafts (respects SEND_EMAILS gate)
+        stamp_enabled: Whether to stamp POs after successful draft (respects STAMP_POS)
+        captured_emails: Optional list to capture emails for reporting
 
     Returns:
-        Agent configured with send_and_stamp_tool only
+        Agent configured with create_draft_tool only
     """
     # Read signature fresh each time
     name = os.getenv("EMAIL_SIGNATURE_NAME", "Leon Yang")
     company = os.getenv("EMAIL_SIGNATURE_COMPANY", "Apache Pressure Products")
 
-    # Create tool with closure over send_enabled and captured_emails
+    # Create tool with closure over draft_enabled, stamp_enabled, and captured_emails
     @function_tool
-    def send_and_stamp_tool(to: str, subject: str, body: str, po_ids_json: str) -> str:
+    def create_draft_tool(to: str, subject: str, body: str, po_ids_json: str) -> str:
         """
-        Send email and stamp PO headers with inquiry date.
+        Create email draft in Outlook Drafts folder for manual review.
 
         Args:
             to: Recipient email address
@@ -100,26 +118,28 @@ def create_email_agent(
             po_ids_json: JSON array string of PO internal IDs, e.g., '["628955", "628957"]'
 
         Returns:
-            JSON string with send and stamp results
+            JSON string with draft creation results
         """
         po_ids = json.loads(po_ids_json)
-        result = send_and_stamp(
+        result = create_draft_and_record(
             to=to,
             subject=subject,
             body=body,
             po_ids=po_ids,
-            send_enabled=send_enabled,
+            draft_enabled=send_enabled,
+            stamp_enabled=stamp_enabled,
         )
 
         # Capture email for reporting if list provided
         if captured_emails is not None:
-            send_result = result.get("send", {})
+            draft_result = result.get("draft", {})
+            stamp_result = result.get("stamp")
             if result.get("skipped"):
                 status = "skipped"
-            elif send_result.get("dry_run"):
+            elif draft_result.get("dry_run"):
                 status = "dry_run"
-            elif send_result.get("ok"):
-                status = "sent"
+            elif draft_result.get("ok"):
+                status = "drafted"
             else:
                 status = "failed"
 
@@ -129,6 +149,10 @@ def create_email_agent(
                 "body": body,
                 "status": status,
                 "po_ids": po_ids,
+                "draft_id": draft_result.get("draft_id"),
+                "web_link": draft_result.get("web_link"),
+                "stamped": stamp_result.get("ok") if stamp_result else False,
+                "stamp_count": len(stamp_result.get("updated", [])) if stamp_result else 0,
             })
 
         return json.dumps(result)
@@ -137,7 +161,8 @@ def create_email_agent(
         f"You are an email writer for vendor PO status inquiries.\n\n"
         f"YOUR ROLE:\n"
         f"- You receive a vendor brief with PO data that has already been analyzed.\n"
-        f"- Write a professional, natural-sounding email and send it using send_and_stamp_tool.\n\n"
+        f"- Write a professional HTML email and create a draft using create_draft_tool.\n"
+        f"- The draft will be saved to Outlook Drafts for manual review before sending.\n\n"
         f"RULES:\n"
         f"1) Only use facts from the brief. Do NOT invent data.\n"
         f"2) Write natural, varied emails. Avoid robotic/templated language.\n"
@@ -147,19 +172,33 @@ def create_email_agent(
         f"   - 30+ days past due: risk of stockouts, higher urgency.\n"
         f"   - Mixed: acknowledge both situations.\n"
         f"4) ONE email per vendor, consolidating all their POs.\n"
-        f"5) End with:\n"
-        f"   Best regards,\n"
-        f"   {name}\n"
-        f"   {company}\n\n"
-        f"6) After calling send_and_stamp_tool, just confirm - don't repeat email content.\n\n"
-        f"TOOL: send_and_stamp_tool(to, subject, body, po_ids_json)\n"
+        f"5) REQUIRED: Write the body as HTML. Use <p> for paragraphs, <br> for line breaks.\n"
+        f"6) REQUIRED HTML TABLE - Include a styled table with ALL open lines:\n"
+        f"   <table border='1' cellpadding='5' cellspacing='0' style='border-collapse: collapse;'>\n"
+        f"   <tr style='background-color: #f2f2f2;'>\n"
+        f"     <th>Date Ordered</th><th>PO#</th><th>SKU</th><th>Qty Ordered</th><th>Shipped</th><th>Open</th>\n"
+        f"   </tr>\n"
+        f"   <tr><td>7/24/2025</td><td>PO7574</td><td>F1SF314FL-2R</td><td>120</td><td></td><td>120</td></tr>\n"
+        f"   </table>\n"
+        f"   (populate from brief: po_date, po_number, item, quantity, leave Shipped blank, qty_open)\n\n"
+        f"7) After the table, include clear instructions asking the vendor to:\n"
+        f"   - Complete the 'Shipped' column with quantities already shipped\n"
+        f"   - Provide tracking/shipment references for shipped items\n"
+        f"   - Provide expected ship dates for items not yet shipped\n"
+        f"   - State this is required so we can update our system\n\n"
+        f"8) End with:\n"
+        f"   <p>Best regards,<br>{name}<br>{company}</p>\n\n"
+        f"9) After calling create_draft_tool, just confirm - don't repeat email content.\n\n"
+        f"TOOL: create_draft_tool(to, subject, body, po_ids_json)\n"
+        f"  - body must be HTML formatted\n"
         f"  - po_ids_json is a JSON array string: '[\"628955\", \"628957\"]'\n"
     )
 
     return Agent(
-        name="PO Email Writer",
+        name="PO Email Drafter",
         instructions=instructions,
-        tools=[send_and_stamp_tool],
+        tools=[create_draft_tool],
+        model="gpt-4o",
     )
 
 
